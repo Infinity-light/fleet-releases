@@ -187,6 +187,9 @@ jobs:
         with:
           tag_name: ${{ github.event.client_payload.tag }}
           name: Fleet ${{ steps.version.outputs.version }}
-          files: release-staging/*
+          files: |
+            release-staging/Fleet-${{ steps.version.outputs.version }}.exe
+            release-staging/Fleet.exe
+            release-staging/latest.json
           draft: false
           prerelease: false
