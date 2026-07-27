@@ -2,7 +2,7 @@ name: Deploy Fleet Web
 
 on:
   repository_dispatch:
-    types: [deploy]
+    types: [deploy, deploy-web]
 
 concurrency:
   group: deploy-beidou-web
@@ -49,7 +49,18 @@ jobs:
           strip_components: 2
           rm: true
 
-      - name: Atomic swap into /var/www/beidou
+      - name: Upload Nginx configuration candidate
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy/nginx/beidou.godpenai.com.conf"
+          target: /tmp/fleet-nginx-staging
+          strip_components: 2
+          rm: true
+
+      - name: Atomic swap Web and validated Nginx configuration
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -58,8 +69,21 @@ jobs:
           script: |
             set -e
             test -f /var/www/beidou-staging/index.html
+            test -f /tmp/fleet-nginx-staging/beidou.godpenai.com.conf
             rsync -a --delete --exclude releases /var/www/beidou-staging/ /var/www/beidou/
             rm -rf /var/www/beidou-staging
+            nginx_config=/etc/nginx/conf.d/beidou.godpenai.com.conf
+            nginx_backup="${nginx_config}.fleet-backup"
+            cp "$nginx_config" "$nginx_backup"
+            install -m 0644 /tmp/fleet-nginx-staging/beidou.godpenai.com.conf "$nginx_config"
+            if ! nginx -t; then
+              mv -f "$nginx_backup" "$nginx_config"
+              nginx -t
+              exit 1
+            fi
+            rm -f "$nginx_backup"
+            rm -rf /tmp/fleet-nginx-staging
+            nginx -s reload
 
       - name: Verify live site serves this build
         run: |
@@ -68,3 +92,4 @@ jobs:
           test -n "$want"
           test "$want" = "$got"
           curl -sf --max-time 15 "https://beidou.godpenai.com/$want" -o /dev/null
+          test "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://beidou.godpenai.com/releases/not-a-real-fleet-build.exe)" = "404"
