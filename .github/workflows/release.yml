@@ -39,7 +39,10 @@ jobs:
             desktop/package-lock.json
 
       - name: Install backend dependencies
-        run: npm ci
+        # better-sqlite3 13 and node-pty ship the audited Windows prebuilds used
+        # by Fleet. Avoid runner-local node-gyp/Visual Studio coupling; the
+        # backend tests and packaged Electron probe load the real binaries.
+        run: npm ci --ignore-scripts
 
       - name: Audit backend production dependencies
         run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
