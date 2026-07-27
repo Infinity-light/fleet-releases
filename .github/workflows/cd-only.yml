@@ -1,0 +1,51 @@
+name: Promote Verified Fleet Artifacts
+
+on:
+  repository_dispatch:
+    types: [cd-only]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify source ref and artifact manifest
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          SOURCE_REPO: ${{ github.event.client_payload.repo }}
+          SOURCE_REF: ${{ github.event.client_payload.ref }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+          MANIFEST_JSON: ${{ toJson(github.event.client_payload.artifact_manifest) }}
+        run: |
+          set -euo pipefail
+          actual=$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_REF" --jq .sha)
+          test "$actual" = "$SOURCE_SHA"
+          printf '%s' "$MANIFEST_JSON" > manifest.json
+          test "$(jq -r .sourceRepo manifest.json)" = "$SOURCE_REPO"
+          test "$(jq -r .sourceSha manifest.json)" = "$SOURCE_SHA"
+          test "$(jq '.artifacts | length' manifest.json)" -gt 0
+
+      - name: Download and verify immutable artifacts
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          jq -c '.artifacts[]' manifest.json | while read -r item; do
+            name=$(jq -r .name <<<"$item")
+            url=$(jq -r .url <<<"$item")
+            sha=$(jq -r .sha256 <<<"$item")
+            test "$name" = "$(basename "$name")"
+            test "${#sha}" -eq 64
+            curl --fail --location --proto '=https' --tlsv1.2 "$url" -o "artifacts/$name"
+            printf '%s  %s\n' "$sha" "artifacts/$name" | sha256sum -c -
+          done
+
+      - name: Publish verified assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.client_payload.tag || github.event.client_payload.ref }}
+          name: Fleet ${{ github.event.client_payload.tag || github.event.client_payload.ref }}
+          files: artifacts/*
+          draft: false
+          prerelease: false

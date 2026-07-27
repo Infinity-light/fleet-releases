@@ -1,0 +1,192 @@
+name: Release Fleet Desktop
+
+on:
+  repository_dispatch:
+    types: [release]
+
+concurrency:
+  group: release-fleet-desktop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-publish:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout exact private source ref
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.client_payload.repo }}
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+
+      - name: Verify source commit binding
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.event.client_payload.source_sha }}"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Audit backend production dependencies
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Test and build bundled backend
+        run: |
+          npm test
+          npm run typecheck
+          npm run build
+
+      - name: Install and build bundled web console
+        working-directory: web
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+          npm test
+          npm run build
+
+      - name: Smoke test visible model-source UI paths
+        run: |
+          npx playwright install chromium
+          node --import tsx scripts/e2e-model-source.mjs
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Audit desktop production dependencies
+        working-directory: desktop
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Test desktop startup, updater, and autostart logic
+        working-directory: desktop
+        run: npm test
+
+      - name: Test release tooling
+        run: node scripts/release/run-tests.mjs
+
+      - name: Verify desktop release version
+        id: version
+        run: node scripts/release/check-version.mjs --github-output
+
+      - name: Verify release tag matches desktop version
+        run: >-
+          node scripts/release/check-version.mjs
+          --expected-tag "${{ github.event.client_payload.tag }}"
+
+      - name: Assemble verified bundled backend, web, and CPA
+        run: node scripts/build-desktop-staging.mjs --skip-build
+
+      - name: Verify staged bundled runtime
+        run: node scripts/release/verify-bundled-runtime.mjs --root build-staging
+
+      - name: Build portable exe
+        working-directory: desktop
+        run: npm run package
+
+      - name: Verify executable metadata
+        run: >-
+          node scripts/release/verify-exe-version.mjs
+          --exe desktop/dist/Fleet.exe
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Verify packaged app.asar contents
+        run: >-
+          node scripts/release/validate-asar.mjs
+          --asar desktop/dist/win-unpacked/resources/app.asar
+          --require main.js
+          --require fleet-process.js
+          --require bundled-runtime.js
+          --require model-source-link.js
+          --require pairing-data.js
+          --require tray.js
+          --require updater.js
+          --require update-core.js
+          --require install-path.js
+          --require autostart.js
+          --require error-log.js
+          --require window-activation.js
+          --require icon-gen.js
+          --require console.html
+          --require preload-console.js
+          --require pairing.html
+          --require preload-pairing.js
+
+      - name: Verify packaged backend archive contents
+        run: >-
+          node scripts/release/validate-asar.mjs
+          --asar desktop/dist/win-unpacked/resources/backend.asar
+          --require dist/cli.js
+          --require web/dist/index.html
+          --require package.json
+          --require fleet-hooks/hooks/on-stop.js
+          --require fleet-hooks/hooks/on-notification.js
+          --require scripts/wechat-db-refresh.py
+          --require voice-engines/chattts/server.py
+          --require voice-engines/chattts/requirements.txt
+          --require node_modules/@anthropic-ai/claude-code/bin/claude.exe
+
+      - name: Verify packaged backend, web, and CPA resources
+        run: node scripts/release/verify-bundled-runtime.mjs --root desktop/dist/win-unpacked/resources
+
+      - name: Smoke test real portable startup and single-instance activation
+        shell: powershell
+        run: >-
+          ./scripts/release/smoke-desktop.ps1
+          -Exe desktop/dist/Fleet.exe
+
+      - name: Smoke test installed updater migration and rollback scenarios
+        run: node scripts/release/smoke-installed-updater.mjs --exe desktop/dist/Fleet.exe
+
+      - name: Smoke test packaged backend and native modules
+        run: node scripts/release/smoke-bundled-backend.mjs --exe desktop/dist/win-unpacked/Fleet.exe
+
+      - name: Smoke test real CPA isolation and authentication
+        run: node scripts/release/smoke-cpa.mjs --exe desktop/dist/win-unpacked/resources/bin/cli-proxy-api.exe
+
+      - name: Prepare release artifacts
+        run: >-
+          node scripts/release/prepare-artifacts.mjs
+          --exe desktop/dist/Fleet.exe
+          --out release-staging
+          --version "${{ steps.version.outputs.version }}"
+          --base-url https://beidou.godpenai.com/releases
+          --changelog "Fix authenticated Hub-to-Fleet forwarding for PWA messages and voice"
+
+      - name: Verify prepared artifacts
+        run: >-
+          node scripts/release/verify-artifacts.mjs
+          --dir release-staging
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Publish verified release to production
+        shell: powershell
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: >-
+          ./scripts/release/publish-desktop.ps1
+          -Version "${{ steps.version.outputs.version }}"
+          -ServerHost "${{ secrets.SERVER_HOST }}"
+          -ServerUser "${{ secrets.SERVER_USER }}"
+
+      - name: Publish verified public release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.client_payload.tag }}
+          name: Fleet ${{ steps.version.outputs.version }}
+          files: release-staging/*
+          draft: false
+          prerelease: false

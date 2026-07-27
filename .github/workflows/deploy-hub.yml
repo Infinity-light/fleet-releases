@@ -1,0 +1,75 @@
+name: Deploy Fleet Hub
+
+on:
+  repository_dispatch:
+    types: [deploy]
+
+concurrency:
+  group: deploy-fleet-hub
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact private source ref
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.client_payload.repo }}
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+
+      - name: Verify source commit binding
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.client_payload.source_sha }}"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+
+      - name: Build and audit
+        working-directory: hub
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+          npm run build
+          test -f dist/index.js
+
+      - name: Upload to staging dir
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "hub/dist/*,hub/package.json,hub/package-lock.json"
+          target: /opt/fleet-hub-staging
+          strip_components: 1
+          rm: true
+
+      - name: Atomic swap and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            STAGING=/opt/fleet-hub-staging
+            DEPLOY=/opt/fleet-hub
+            CONFIG=/root/.fleet/hub-server.json
+            test -f "$STAGING/dist/index.js"
+            test -s "$CONFIG"
+            mkdir -p "$DEPLOY"
+            rsync -a --delete "$STAGING/" "$DEPLOY/"
+            rm -rf "$STAGING"
+            cd "$DEPLOY"
+            npm ci --omit=dev
+            pm2 restart fleet-hub
+
+      - name: Verify Hub health
+        run: |
+          sleep 3
+          curl -sf --max-time 10 https://beidou.godpenai.com/hub/health | grep -q '"ok":true'
+          sleep 60
+          curl -sf --max-time 10 https://beidou.godpenai.com/hub/health | grep -q '"ok":true'
