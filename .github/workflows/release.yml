@@ -131,7 +131,6 @@ jobs:
           --out release-staging
           --version "${{ steps.version.outputs.version }}"
           --base-url https://beidou.godpenai.com/releases
-          --changelog "Fix authenticated Hub-to-Fleet forwarding for PWA messages and voice"
 
       - name: Verify prepared artifacts
         run: >-

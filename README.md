@@ -9,4 +9,6 @@ is checked out at the exact `repo/ref/source_sha` carried by
 
 Artifact layout and runtime file contracts live in the checked-out Fleet source
 repository. Proxy workflows call `scripts/release/verify-packaged-desktop.mjs`
-and must not hard-code carrier formats such as `backend.asar` or `backend.tar`.
+and must not hard-code carrier formats such as `backend.asar` or `backend.tar`,
+runtime file lists, or release notes. `latest.json` release notes are derived
+from the exact version section in the checked-out source `CHANGELOG.md`.
