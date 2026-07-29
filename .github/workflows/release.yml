@@ -106,44 +106,8 @@ jobs:
           --exe desktop/dist/Fleet.exe
           --version "${{ steps.version.outputs.version }}"
 
-      - name: Verify packaged app.asar contents
-        run: >-
-          node scripts/release/validate-asar.mjs
-          --asar desktop/dist/win-unpacked/resources/app.asar
-          --require main.js
-          --require fleet-process.js
-          --require bundled-runtime.js
-          --require model-source-link.js
-          --require pairing-data.js
-          --require tray.js
-          --require updater.js
-          --require update-core.js
-          --require install-path.js
-          --require autostart.js
-          --require error-log.js
-          --require window-activation.js
-          --require icon-gen.js
-          --require console.html
-          --require preload-console.js
-          --require pairing.html
-          --require preload-pairing.js
-
-      - name: Verify packaged backend archive contents
-        run: >-
-          node scripts/release/validate-asar.mjs
-          --asar desktop/dist/win-unpacked/resources/backend.asar
-          --require dist/cli.js
-          --require web/dist/index.html
-          --require package.json
-          --require fleet-hooks/hooks/on-stop.js
-          --require fleet-hooks/hooks/on-notification.js
-          --require scripts/wechat-db-refresh.py
-          --require voice-engines/chattts/server.py
-          --require voice-engines/chattts/requirements.txt
-          --require node_modules/@anthropic-ai/claude-code/bin/claude.exe
-
-      - name: Verify packaged backend, web, and CPA resources
-        run: node scripts/release/verify-bundled-runtime.mjs --root desktop/dist/win-unpacked/resources
+      - name: Verify packaged desktop resources
+        run: node scripts/release/verify-packaged-desktop.mjs --resources desktop/dist/win-unpacked/resources
 
       - name: Smoke test real portable startup and single-instance activation
         shell: powershell
