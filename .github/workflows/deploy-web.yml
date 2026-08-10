@@ -95,5 +95,5 @@ jobs:
           curl -sf --max-time 15 "https://beidou.godpenai.com/$want" -o /dev/null
           test "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://beidou.godpenai.com/releases/not-a-real-fleet-build.exe)" = "404"
 
-      - name: Verify published Tianxuan PWA
+      - name: Smoke verify published Tianxuan PWA
         run: node scripts/verify-tianxuan-pwa-live.mjs
