@@ -163,13 +163,81 @@ jobs:
           -ServerUser "${{ secrets.SERVER_USER }}"
 
       - name: Publish verified public release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.client_payload.tag }}
-          name: Fleet ${{ steps.version.outputs.version }}
-          files: |
-            release-staging/Fleet-${{ steps.version.outputs.version }}.exe
-            release-staging/Fleet.exe
-            release-staging/latest.json
-          draft: false
-          prerelease: false
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.client_payload.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:RELEASE_TAG
+          $version = $env:RELEASE_VERSION
+          $expectedTag = "v$version"
+
+          if ([string]::IsNullOrWhiteSpace($repo)) {
+            throw 'GITHUB_REPOSITORY is missing'
+          }
+          if ($tag -ne $expectedTag) {
+            throw "Release tag mismatch: expected $expectedTag, got $tag"
+          }
+
+          $assets = @(
+            "release-staging/Fleet-$version.exe",
+            'release-staging/Fleet.exe',
+            'release-staging/latest.json'
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Release asset is missing: $asset"
+            }
+          }
+
+          function Invoke-GhRetry {
+            param(
+              [Parameter(Mandatory = $true)][string]$Operation,
+              [Parameter(Mandatory = $true)][string[]]$Arguments
+            )
+
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              & gh @Arguments
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -eq 0) {
+                return
+              }
+              if ($attempt -eq 5) {
+                throw "$Operation failed after 5 attempts (exit code $exitCode)"
+              }
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
+
+          $releaseReady = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            & gh release view $tag --repo $repo *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $releaseReady = $true
+              break
+            }
+
+            & gh release create $tag --repo $repo --title "Fleet $version" --notes "Verified Fleet desktop $version release."
+            if ($LASTEXITCODE -eq 0) {
+              $releaseReady = $true
+              break
+            }
+
+            if ($attempt -lt 5) {
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
+          if (-not $releaseReady) {
+            throw "Unable to find or create public release $tag after 5 attempts"
+          }
+
+          foreach ($asset in $assets) {
+            Invoke-GhRetry -Operation "Upload $asset" -Arguments @(
+              'release', 'upload', $tag, $asset,
+              '--repo', $repo,
+              '--clobber'
+            )
+          }
