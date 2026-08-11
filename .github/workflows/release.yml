@@ -169,7 +169,10 @@ jobs:
           RELEASE_TAG: ${{ github.event.client_payload.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          # Windows PowerShell 5.1 promotes native stderr to a terminating
+          # NativeCommandError under Stop before $LASTEXITCODE can drive the
+          # explicit create/upload retry loops below.
+          $ErrorActionPreference = 'Continue'
           $repo = $env:GITHUB_REPOSITORY
           $tag = $env:RELEASE_TAG
           $version = $env:RELEASE_VERSION
