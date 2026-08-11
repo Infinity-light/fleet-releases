@@ -48,6 +48,14 @@ jobs:
       - name: Audit backend production dependencies
         run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
 
+      - name: Install and audit bundled web console dependencies
+        working-directory: web
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test and build bundled backend
         run: |
           npm test
@@ -57,13 +65,9 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Install and build bundled web console
+      - name: Test and build bundled web console
         working-directory: web
         run: |
-          npm ci
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run build
