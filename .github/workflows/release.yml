@@ -15,20 +15,35 @@ permissions:
 jobs:
   build-publish:
     runs-on: windows-latest
+    env:
+      FLEET_RELEASE_SOURCE_REPOSITORY: ${{ github.event.client_payload.repo }}
+      FLEET_RELEASE_SOURCE_REVISION: ${{ github.event.client_payload.source_sha }}
+      FLEET_RELEASE_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
+      FLEET_RELEASE_TAG: ${{ github.event.client_payload.tag }}
+      FLEET_REQUIRE_RELEASE_PROVENANCE: "1"
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout exact private source ref
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.event.client_payload.repo }}
-          ref: ${{ github.event.client_payload.ref }}
+          repository: Infinity-light/fleet
+          ref: ${{ github.event.client_payload.source_sha }}
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          fetch-depth: 0
 
       - name: Verify source commit binding
         shell: bash
         run: |
+          test "${{ github.event.client_payload.repo }}" = "Infinity-light/fleet"
+          test "${{ github.event.client_payload.contract_version }}" = "1"
+          test "${{ github.event.client_payload.dispatch_mode }}" = "full-pipeline"
+          test "${{ github.event.client_payload.tag }}" = "${{ github.event.client_payload.source_ref }}"
+          test "${{ github.event.client_payload.surfaces[0] }}" = "desktop_distribution"
           test "$(git rev-parse HEAD)" = "${{ github.event.client_payload.source_sha }}"
+          git fetch --force origin "refs/tags/${{ github.event.client_payload.tag }}:refs/tags/${{ github.event.client_payload.tag }}"
+          test "$(git rev-parse 'refs/tags/${{ github.event.client_payload.tag }}^{}')" = "${{ github.event.client_payload.source_sha }}"
+          echo "FLEET_RELEASE_TIMESTAMP=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
         with:
@@ -152,7 +167,18 @@ jobs:
           --dir release-staging
           --version "${{ steps.version.outputs.version }}"
 
+      - name: Preflight immutable public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/release/publish-github-release.mjs preflight
+          --dir release-staging
+          --repo "${{ github.repository }}"
+          --tag "${{ github.event.client_payload.tag }}"
+          --version "${{ steps.version.outputs.version }}"
+
       - name: Publish verified release to production
+        id: production_release
         shell: powershell
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -163,84 +189,36 @@ jobs:
           -ServerUser "${{ secrets.SERVER_USER }}"
 
       - name: Publish verified public release assets
-        shell: powershell
+        id: github_release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.client_payload.tag }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          node scripts/release/publish-github-release.mjs publish
+          --dir release-staging
+          --repo "${{ github.repository }}"
+          --tag "${{ github.event.client_payload.tag }}"
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Roll back production if public release publication fails
+        if: ${{ failure() && steps.production_release.outcome == 'success' && steps.github_release.outcome == 'failure' }}
+        shell: powershell
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          # Windows PowerShell 5.1 promotes native stderr to a terminating
-          # NativeCommandError under Stop before $LASTEXITCODE can drive the
-          # explicit create/upload retry loops below.
-          $ErrorActionPreference = 'Continue'
-          $repo = $env:GITHUB_REPOSITORY
-          $tag = $env:RELEASE_TAG
-          $version = $env:RELEASE_VERSION
-          $expectedTag = "v$version"
+          $manifest = Get-Content -LiteralPath release-staging/latest.json -Raw | ConvertFrom-Json
+          ./scripts/release/publish-desktop.ps1 `
+            -Version "${{ steps.version.outputs.version }}" `
+            -ServerHost "${{ secrets.SERVER_HOST }}" `
+            -ServerUser "${{ secrets.SERVER_USER }}" `
+            -RecoverReleaseId ([string]$manifest.releaseId)
 
-          if ([string]::IsNullOrWhiteSpace($repo)) {
-            throw 'GITHUB_REPOSITORY is missing'
-          }
-          if ($tag -ne $expectedTag) {
-            throw "Release tag mismatch: expected $expectedTag, got $tag"
-          }
-
-          $assets = @(
-            "release-staging/Fleet-$version.exe",
-            'release-staging/Fleet.exe',
-            'release-staging/latest.json'
-          )
-          foreach ($asset in $assets) {
-            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
-              throw "Release asset is missing: $asset"
-            }
-          }
-
-          function Invoke-GhRetry {
-            param(
-              [Parameter(Mandatory = $true)][string]$Operation,
-              [Parameter(Mandatory = $true)][string[]]$Arguments
-            )
-
-            for ($attempt = 1; $attempt -le 5; $attempt++) {
-              & gh @Arguments
-              $exitCode = $LASTEXITCODE
-              if ($exitCode -eq 0) {
-                return
-              }
-              if ($attempt -eq 5) {
-                throw "$Operation failed after 5 attempts (exit code $exitCode)"
-              }
-              Start-Sleep -Seconds (10 * $attempt)
-            }
-          }
-
-          $releaseReady = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            & gh release view $tag --repo $repo *> $null
-            if ($LASTEXITCODE -eq 0) {
-              $releaseReady = $true
-              break
-            }
-
-            & gh release create $tag --repo $repo --title "Fleet $version" --notes "Verified Fleet desktop $version release."
-            if ($LASTEXITCODE -eq 0) {
-              $releaseReady = $true
-              break
-            }
-
-            if ($attempt -lt 5) {
-              Start-Sleep -Seconds (10 * $attempt)
-            }
-          }
-          if (-not $releaseReady) {
-            throw "Unable to find or create public release $tag after 5 attempts"
-          }
-
-          foreach ($asset in $assets) {
-            Invoke-GhRetry -Operation "Upload $asset" -Arguments @(
-              'release', 'upload', $tag, $asset,
-              '--repo', $repo,
-              '--clobber'
-            )
-          }
+      - name: Preserve release evidence for every terminal outcome
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ github.event.client_payload.dispatch_id }}
+          path: |
+            release-staging/release-attestation-*.json
+            release-staging/release-ledger-*.jsonl
+            release-staging/release-ledger-*.json
+          if-no-files-found: warn
