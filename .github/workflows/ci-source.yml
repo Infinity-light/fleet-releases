@@ -1,0 +1,77 @@
+name: CI Fleet Source Commit
+run-name: "ci-only ${{ inputs.source_sha || github.event.client_payload.source_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA from Infinity-light/fleet
+        required: true
+        type: string
+  repository_dispatch:
+    types: [ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "fleet-source-ci-${{ inputs.source_sha || github.event.client_payload.source_sha }}"
+  cancel-in-progress: false
+
+jobs:
+  verify-source:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      FLEET_SOURCE_SHA: ${{ inputs.source_sha || github.event.client_payload.source_sha }}
+    steps:
+      - name: Validate immutable source SHA
+        shell: pwsh
+        run: |
+          if ($env:FLEET_SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') {
+            throw "source_sha must be an exact lowercase 40-character commit SHA"
+          }
+
+      - name: Checkout exact private source commit
+        uses: actions/checkout@v5
+        with:
+          repository: Infinity-light/fleet
+          ref: ${{ env.FLEET_SOURCE_SHA }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source commit binding
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actual -cne $env:FLEET_SOURCE_SHA) {
+            throw "checked out $actual instead of $env:FLEET_SOURCE_SHA"
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install backend dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Typecheck backend and Web
+        run: npm run typecheck
+
+      - name: Build backend
+        run: npm run build
+
+      - name: Build Web
+        working-directory: web
+        run: npm run build
+
+      - name: Run full test suite
+        run: npm test
