@@ -54,6 +54,13 @@ jobs:
             web/package-lock.json
             desktop/package-lock.json
 
+      - name: Install WeChat database test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: pycryptodome==3.23.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "from Crypto.Cipher import AES; print('PyCryptodome AES ready')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Install backend dependencies
         # better-sqlite3 13 and node-pty ship the audited Windows prebuilds used
         # by Fleet. Avoid runner-local node-gyp/Visual Studio coupling; the
