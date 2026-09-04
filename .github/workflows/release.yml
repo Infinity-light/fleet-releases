@@ -61,6 +61,12 @@ jobs:
           python -c "from Crypto.Cipher import AES; print('PyCryptodome AES ready')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Node 22 runners can ship an older npm client that still calls the
+      # retired registry `audits/quick` endpoint. Pin npm 11 so every install
+      # and audit uses the supported bulk advisory API consistently.
+      - name: Pin npm audit client
+        run: npm install --global npm@11.5.1
+
       - name: Install backend dependencies
         # better-sqlite3 13 and node-pty ship the audited Windows prebuilds used
         # by Fleet. Avoid runner-local node-gyp/Visual Studio coupling; the
