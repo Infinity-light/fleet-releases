@@ -1,0 +1,237 @@
+name: Build Fleet Desktop Candidate
+run-name: "candidate ${{ inputs.source_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact immutable private source SHA; no tag or release is created
+        required: true
+        type: string
+      imagegen_sha:
+        description: Merged ImageGen chat fix SHA which must be an ancestor of source_sha
+        required: true
+        type: string
+      expected_version:
+        description: Stable candidate version matching package and lock files
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "fleet-desktop-candidate-${{ inputs.source_sha }}"
+  cancel-in-progress: false
+
+jobs:
+  build-candidate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CI: "true"
+      FLEET_RELEASE_SOURCE_REPOSITORY: Infinity-light/fleet
+      FLEET_RELEASE_SOURCE_REVISION: ${{ inputs.source_sha }}
+      FLEET_RELEASE_SOURCE_REF: ${{ inputs.source_sha }}
+      FLEET_IMAGEGEN_FIX_SHA: ${{ inputs.imagegen_sha }}
+      FLEET_READER_FIX_SHA: 0fe7fcaa72a7d7714c784fedd73f01e01158f305
+      FLEET_EXPECTED_VERSION: ${{ inputs.expected_version }}
+      # This is an unpublished candidate. Source SHA/run identity are real;
+      # release tag provenance remains null until a separately authorized release.
+      FLEET_REQUIRE_RELEASE_PROVENANCE: "0"
+    steps:
+      - name: Validate immutable candidate inputs
+        shell: pwsh
+        run: |
+          foreach ($value in @($env:FLEET_RELEASE_SOURCE_REVISION, $env:FLEET_IMAGEGEN_FIX_SHA)) {
+            if ($value -cnotmatch '^[0-9a-f]{40}$') { throw "Source/fix SHA must be exact lowercase 40-character SHA" }
+          }
+          if ($env:FLEET_EXPECTED_VERSION -cnotmatch '^\d+\.\d+\.\d+$') { throw "Version must be stable SemVer" }
+
+      - name: Checkout exact private candidate source
+        uses: actions/checkout@v5
+        with:
+          repository: Infinity-light/fleet
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source binding and both fixes
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:FLEET_RELEASE_SOURCE_REVISION) { throw "Candidate source binding failed" }
+          foreach ($fix in @($env:FLEET_READER_FIX_SHA, $env:FLEET_IMAGEGEN_FIX_SHA)) {
+            git merge-base --is-ancestor $fix HEAD
+            if ($LASTEXITCODE -ne 0) { throw "Required fix is missing from candidate" }
+          }
+          "FLEET_RELEASE_TIMESTAMP=$(git show -s --format=%cI HEAD)" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install WeChat database test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: pycryptodome==3.23.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "from Crypto.Cipher import AES; print('PyCryptodome AES ready')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Node 22 runners can ship an older npm client that still calls the
+      # retired registry `audits/quick` endpoint. Pin npm 11 so every install
+      # and audit uses the supported bulk advisory API consistently.
+      - name: Pin npm audit client
+        run: npm install --global npm@11.5.1
+
+      - name: Install backend dependencies
+        # better-sqlite3 13 and node-pty ship the audited Windows prebuilds used
+        # by Fleet. Avoid runner-local node-gyp/Visual Studio coupling; the
+        # backend tests and packaged Electron probe load the real binaries.
+        run: npm ci --ignore-scripts
+
+      - name: Audit backend production dependencies
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Install and audit bundled web console dependencies
+        working-directory: web
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test and build bundled backend
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test and build bundled web console
+        working-directory: web
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test visible model-source UI paths
+        run: |
+          npx playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --import tsx scripts/e2e-model-source.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Audit desktop production dependencies
+        working-directory: desktop
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Test desktop startup, updater, and autostart logic
+        working-directory: desktop
+        run: npm test
+
+      - name: Test release tooling
+        run: node scripts/release/run-tests.mjs
+
+      - name: Verify desktop release version
+        id: version
+        run: node scripts/release/check-version.mjs --github-output
+
+      - name: Verify release tag matches desktop version
+        run: >-
+          node scripts/release/check-version.mjs
+          --expected-tag "v${{ inputs.expected_version }}"
+
+      - name: Assemble verified bundled backend, web, and CPA
+        run: node scripts/build-desktop-staging.mjs --skip-build
+
+      - name: Verify staged bundled runtime
+        run: node scripts/release/verify-bundled-runtime.mjs --root build-staging
+
+      - name: Build portable exe
+        working-directory: desktop
+        run: npm run package
+
+      - name: Verify executable metadata
+        run: >-
+          node scripts/release/verify-exe-version.mjs
+          --exe desktop/dist/Fleet.exe
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Verify packaged desktop resources
+        run: node scripts/release/verify-packaged-desktop.mjs --resources desktop/dist/win-unpacked/resources
+
+      - name: Smoke test real portable startup and single-instance activation
+        shell: powershell
+        run: >-
+          ./scripts/release/smoke-desktop.ps1
+          -Exe desktop/dist/Fleet.exe
+
+      - name: Smoke test installed updater migration and rollback scenarios
+        run: node scripts/release/smoke-installed-updater.mjs --exe desktop/dist/Fleet.exe
+
+      - name: Smoke test packaged backend and native modules
+        run: node scripts/release/smoke-bundled-backend.mjs --exe desktop/dist/win-unpacked/Fleet.exe
+
+      - name: Smoke test real CPA isolation and authentication
+        run: node scripts/release/smoke-cpa.mjs --exe desktop/dist/win-unpacked/resources/bin/cli-proxy-api.exe
+
+      - name: Prepare release artifacts
+        run: >-
+          node scripts/release/prepare-artifacts.mjs
+          --exe desktop/dist/Fleet.exe
+          --out candidate-staging
+          --version "${{ steps.version.outputs.version }}"
+          --base-url "https://github.com/${{ github.repository }}/releases/download/v${{ inputs.expected_version }}"
+
+      - name: Verify prepared artifacts
+        run: >-
+          node scripts/release/verify-artifacts.mjs
+          --dir candidate-staging
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Record unpublished candidate identity
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath desktop/dist/win-unpacked/resources/fleet-runtime-manifest.json -Destination candidate-staging/fleet-runtime-manifest.json
+          $manifest = Get-Content -LiteralPath candidate-staging/latest.json -Raw | ConvertFrom-Json
+          $runtime = Get-Content -LiteralPath candidate-staging/fleet-runtime-manifest.json -Raw | ConvertFrom-Json
+          $record = [ordered]@{
+            schemaVersion = 1
+            status = "candidate-only"
+            published = $false
+            activated = $false
+            version = $manifest.version
+            sourceRepository = $env:FLEET_RELEASE_SOURCE_REPOSITORY
+            sourceSha = $env:FLEET_RELEASE_SOURCE_REVISION
+            includedFixes = @{ reader = $env:FLEET_READER_FIX_SHA; imagegen = $env:FLEET_IMAGEGEN_FIX_SHA }
+            workflowRunUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            artifact = $manifest.platforms.win
+            runtimeId = "$($runtime.version):$($runtime.runtimeSha256)"
+            activationRequiresSeparateAuthorization = $true
+          }
+          $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath candidate-staging/candidate-only.json -Encoding utf8
+
+      # There are intentionally no publish, SSH, latest activation, or install
+      # steps in this workflow. CI artifacts do not update any Fleet client.
+      - name: Preserve candidate carrier and evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-candidate-${{ inputs.source_sha }}
+          path: candidate-staging/
+          retention-days: 14
+          if-no-files-found: warn
