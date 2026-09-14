@@ -8,9 +8,15 @@ on:
         description: Exact immutable private source SHA; no tag or release is created
         required: true
         type: string
-      imagegen_sha:
-        description: Merged ImageGen chat fix SHA which must be an ancestor of source_sha
+      coverage:
+        description: Candidate coverage; reader-only is preliminary and never approved for activation
         required: true
+        type: choice
+        options: [reader-only, combined]
+        default: combined
+      imagegen_sha:
+        description: Required for combined; merged ImageGen fix SHA must be an ancestor of source_sha
+        required: false
         type: string
       expected_version:
         description: Stable candidate version matching package and lock files
@@ -34,6 +40,7 @@ jobs:
       FLEET_RELEASE_SOURCE_REVISION: ${{ inputs.source_sha }}
       FLEET_RELEASE_SOURCE_REF: ${{ inputs.source_sha }}
       FLEET_IMAGEGEN_FIX_SHA: ${{ inputs.imagegen_sha }}
+      FLEET_CANDIDATE_COVERAGE: ${{ inputs.coverage }}
       FLEET_READER_FIX_SHA: 0fe7fcaa72a7d7714c784fedd73f01e01158f305
       FLEET_EXPECTED_VERSION: ${{ inputs.expected_version }}
       # This is an unpublished candidate. Source SHA/run identity are real;
@@ -43,9 +50,10 @@ jobs:
       - name: Validate immutable candidate inputs
         shell: pwsh
         run: |
-          foreach ($value in @($env:FLEET_RELEASE_SOURCE_REVISION, $env:FLEET_IMAGEGEN_FIX_SHA)) {
-            if ($value -cnotmatch '^[0-9a-f]{40}$') { throw "Source/fix SHA must be exact lowercase 40-character SHA" }
-          }
+          if ($env:FLEET_RELEASE_SOURCE_REVISION -cnotmatch '^[0-9a-f]{40}$') { throw "Source SHA must be exact lowercase 40-character SHA" }
+          if ($env:FLEET_CANDIDATE_COVERAGE -notin @('reader-only', 'combined')) { throw "Unknown candidate coverage" }
+          if ($env:FLEET_CANDIDATE_COVERAGE -eq 'combined' -and $env:FLEET_IMAGEGEN_FIX_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Combined candidate requires exact ImageGen fix SHA" }
+          if ($env:FLEET_CANDIDATE_COVERAGE -eq 'reader-only' -and $env:FLEET_IMAGEGEN_FIX_SHA) { throw "Preliminary candidate must not claim an ImageGen fix" }
           if ($env:FLEET_EXPECTED_VERSION -cnotmatch '^\d+\.\d+\.\d+$') { throw "Version must be stable SemVer" }
 
       - name: Checkout exact private candidate source
@@ -62,7 +70,9 @@ jobs:
         run: |
           $actual = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $actual -cne $env:FLEET_RELEASE_SOURCE_REVISION) { throw "Candidate source binding failed" }
-          foreach ($fix in @($env:FLEET_READER_FIX_SHA, $env:FLEET_IMAGEGEN_FIX_SHA)) {
+          $fixes = @($env:FLEET_READER_FIX_SHA)
+          if ($env:FLEET_CANDIDATE_COVERAGE -eq 'combined') { $fixes += $env:FLEET_IMAGEGEN_FIX_SHA }
+          foreach ($fix in $fixes) {
             git merge-base --is-ancestor $fix HEAD
             if ($LASTEXITCODE -ne 0) { throw "Required fix is missing from candidate" }
           }
@@ -214,6 +224,7 @@ jobs:
             status = "candidate-only"
             published = $false
             activated = $false
+            coverage = $env:FLEET_CANDIDATE_COVERAGE
             version = $manifest.version
             sourceRepository = $env:FLEET_RELEASE_SOURCE_REPOSITORY
             sourceSha = $env:FLEET_RELEASE_SOURCE_REVISION
