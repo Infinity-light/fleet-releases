@@ -1,0 +1,165 @@
+name: Release Fleet WeChat Connector (employee)
+run-name: "wechat-connector ${{ inputs.tag || github.event.client_payload.tag }} ${{ inputs.source_sha || github.event.client_payload.source_sha }}"
+
+# Builds the employee edition of the standalone WeChat connector from an exact,
+# tagged Fleet commit and publishes it to the fixed internal download address.
+# The release contract (file names, download address, manifest, checks) lives in
+# the source repository: wechat-connector/scripts/release-contract.mjs, build.mjs,
+# smoke.mjs and publish.mjs. This workflow only calls them.
+#
+# Binaries are never uploaded as workflow artifacts or GitHub releases here: this
+# repository is public and the connector is an internal tool.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA from Infinity-light/fleet
+        required: true
+        type: string
+      tag:
+        description: Tag in Infinity-light/fleet (wechat-connector-vX.Y.Z) that points at source_sha
+        required: true
+        type: string
+      publish:
+        description: Publish to the internal download address (off = build and smoke only)
+        required: true
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [wechat-connector-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-wechat-connector
+  cancel-in-progress: false
+
+jobs:
+  build-publish:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.client_payload.source_sha }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+      PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+      # Official CPython embeddable runtime bundled as python-runtime/ (WeChat 4.x reader).
+      PYTHON_EMBED_URL: https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip
+      PYTHON_EMBED_SHA256: f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65
+      FLEET_WECHAT_UPDATE_URL: "off"
+    steps:
+      - name: Validate inputs
+        shell: pwsh
+        run: |
+          if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "source_sha must be an exact lowercase 40-character commit SHA" }
+          if ($env:RELEASE_TAG -cnotmatch '^wechat-connector-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "tag must be wechat-connector-vX.Y.Z" }
+
+      - name: Checkout exact private source commit
+        uses: actions/checkout@v5
+        with:
+          repository: Infinity-light/fleet
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source commit, tag and version binding
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actual -cne $env:SOURCE_SHA) { throw "checked out $actual instead of $env:SOURCE_SHA" }
+          $tagSha = gh api "repos/Infinity-light/fleet/commits/$env:RELEASE_TAG" --jq .sha
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tagSha -cne $env:SOURCE_SHA) { throw "tag $env:RELEASE_TAG points at $tagSha, not $env:SOURCE_SHA" }
+          $version = (Get-Content wechat-connector/package.json -Raw | ConvertFrom-Json).version
+          if ("wechat-connector-v$version" -cne $env:RELEASE_TAG) { throw "wechat-connector/package.json is $version but the tag is $env:RELEASE_TAG" }
+          "CONNECTOR_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The bundled runtime is the runner's node.exe: pin the version the connector was verified with.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.14.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: pycryptodome==3.23.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Typecheck and test the connector and the shared WeChat code
+        run: |
+          npx tsc --noEmit -p wechat-connector/tsconfig.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx vitest run wechat-connector src/tianshu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download the pinned Python embeddable runtime
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "python-3.13.7-embed-amd64.zip"
+          Invoke-WebRequest -Uri $env:PYTHON_EMBED_URL -OutFile $zip -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:PYTHON_EMBED_SHA256) { throw "Python embeddable zip SHA-256 is $hash" }
+          "PYTHON_EMBED_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup --version=6.7.1 -y --no-progress
+            if ($LASTEXITCODE -ne 0) { choco install innosetup -y --no-progress }
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe is missing" }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the employee installer and release directory
+        run: >-
+          node wechat-connector/scripts/build.mjs
+          --edition employee --package --require-installer
+          --python-embed "${{ env.PYTHON_EMBED_ZIP }}"
+          --python-embed-sha256 ${{ env.PYTHON_EMBED_SHA256 }}
+          --iscc "${{ env.ISCC_PATH }}"
+          --out build-wechat
+          --source-sha ${{ env.SOURCE_SHA }}
+
+      - name: Smoke test the bundle and a silent install into a folder with spaces
+        run: >-
+          node wechat-connector/scripts/smoke.mjs
+          --stage build-wechat/FleetWeChatConnector
+          --edition employee
+          --installer "build-wechat/release/FleetWeChatConnector-Employee-Setup-${{ env.CONNECTOR_VERSION }}.exe"
+
+      - name: Verify the release directory
+        run: node wechat-connector/scripts/publish.mjs --dir build-wechat/release --edition employee --dry-run
+
+      - name: Publish to the internal download address
+        if: ${{ env.PUBLISH == 'true' }}
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: node wechat-connector/scripts/publish.mjs --dir build-wechat/release --edition employee
+
+      - name: Keep checksums and the manifest as evidence (no binaries)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat-connector-evidence-${{ env.SOURCE_SHA }}
+          path: |
+            build-wechat/release/SHA256SUMS-*.txt
+            build-wechat/release/latest.json
+          if-no-files-found: warn
