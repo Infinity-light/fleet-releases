@@ -1,0 +1,168 @@
+name: Verify Fleet WeChat Connector (macOS)
+run-name: "wechat-connector mac ${{ inputs.version }} ${{ inputs.source_sha }}"
+
+# Verifies the macOS tarballs of the standalone WeChat connector on real macOS
+# (Apple Silicon and Intel) before they are promoted to the public download path.
+# The tarballs are built from the exact source commit by
+# wechat-connector/scripts/build-mac.mjs and staged on the public OSS bucket; this
+# job downloads them by URL, refuses any byte that does not match the given SHA-256,
+# installs them as a user would, and runs the checks below. Nothing is uploaded:
+# no artifacts, no releases, no secrets other than the private-source checkout token.
+#
+# What it proves: install.sh + LaunchAgent, the bundled Node/Python/native modules on
+# this CPU, CommonCrypto AES, the Mach reader (self-read), the keychain key store,
+# decrypting a synthetic SQLCipher4 WeChat 4.x account end to end, doctor, the stdio
+# MCP tools, the voice worker, the confirmation-window script, uninstall.
+# What it cannot prove: reading a real logged-in WeChat for Mac (no WeChat on runners,
+# SIP cannot be turned off here).
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA from Infinity-light/fleet that built the tarballs
+        required: true
+        type: string
+      version:
+        description: Connector version (x.y.z)
+        required: true
+        type: string
+      base_url:
+        description: HTTPS directory holding the staged tarballs
+        required: true
+        type: string
+      sha256_arm64:
+        description: SHA-256 of the arm64 tarball
+        required: true
+        type: string
+      sha256_x64:
+        description: SHA-256 of the x64 tarball
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-wechat-connector-mac
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      VERSION: ${{ inputs.version }}
+      BASE_URL: ${{ inputs.base_url }}
+      ARCH: ${{ matrix.arch }}
+      EXPECTED_SHA256: ${{ matrix.arch == 'arm64' && inputs.sha256_arm64 || inputs.sha256_x64 }}
+      FLEET_WECHAT_UPDATE_URL: "off"
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "source_sha must be 40 lowercase hex"; exit 1; }
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "bad version"; exit 1; }
+          [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "base_url must be https"; exit 1; }
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "sha256 must be 64 lowercase hex"; exit 1; }
+          echo "machine: $(uname -m), macOS $(sw_vers -productVersion)"
+
+      - name: Checkout exact private source commit (tests and the e2e script)
+        uses: actions/checkout@v5
+        with:
+          repository: Infinity-light/fleet
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download and verify the tarball
+        run: |
+          set -euo pipefail
+          NAME="FleetWeChatConnector-Employee-${VERSION}-mac-${ARCH}.tar.gz"
+          curl --fail --location --silent --show-error --proto '=https' --retry 3 -o "$RUNNER_TEMP/$NAME" "$BASE_URL/$NAME"
+          ACTUAL=$(shasum -a 256 "$RUNNER_TEMP/$NAME" | cut -d' ' -f1)
+          [ "$ACTUAL" = "$EXPECTED_SHA256" ] || { echo "SHA-256 mismatch: $ACTUAL"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/pkg"
+          tar -xzf "$RUNNER_TEMP/$NAME" -C "$RUNNER_TEMP/pkg"
+          echo "PKG=$RUNNER_TEMP/pkg/FleetWeChatConnector" >> "$GITHUB_ENV"
+          echo "INSTALL=$HOME/Applications/FleetWeChatConnector" >> "$GITHUB_ENV"
+
+      - name: Install as a user would (install.sh, with login autostart)
+        run: |
+          set -euo pipefail
+          "$PKG/install.sh"
+          [ "$("$INSTALL/wechat-connector" version)" = "$VERSION" ]
+          "$INSTALL/wechat-connector" autostart status | grep '"enabled": true'
+          launchctl print "gui/$(id -u)/com.entropyark.fleet-wechat-connector" | head -20
+          "$INSTALL/wechat-connector" status | grep '"running": true'
+          file "$INSTALL/node/bin/node" "$INSTALL/python-runtime/bin/python3.13"
+
+      - name: Python tests with the bundled interpreter (CommonCrypto AES, Mach self-read, keychain logic)
+        working-directory: scripts
+        run: '"$INSTALL/python-runtime/bin/python3" -m unittest -v wechat_mac_key_test'
+
+      - name: Refresh-machinery tests on macOS (system Python + test-only pycryptodome)
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pycryptodome==3.23.0
+          "$RUNNER_TEMP/venv/bin/python" -m unittest wechat_db_refresh_test
+
+      - name: Voice worker loads sherpa-onnx's darwin binary
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/voice.mjs" <<'EOF'
+          import { fork } from 'node:child_process';
+          const child = fork(process.env.VOICE_WORKER, [], { execArgv: [], stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+          const timer = setTimeout(() => { console.log('timeout'); child.kill(); process.exit(1); }, 30000);
+          child.on('message', (m) => { console.log(m.t + ':' + (m.kind ?? '')); clearTimeout(timer); child.kill(); process.exit(m.t === 'fatal' && m.kind === 'model' ? 0 : 1); });
+          child.send({ t: 'init', config: { basePath: '.', format: 'v3', modelFile: 'missing.onnx', tokensFile: 'missing.txt', threads: 1 } });
+          EOF
+          VOICE_WORKER="$INSTALL/app/wechat-voice-worker.js" "$INSTALL/node/bin/node" "$RUNNER_TEMP/voice.mjs"
+
+      - name: The confirmation-window script (JXA) compiles
+        run: |
+          set -euo pipefail
+          "$INSTALL/node/bin/node" -e '
+            const s = require("fs").readFileSync(process.argv[1], "utf8");
+            const m = /CONFIRM_JXA = \[([\s\S]*?)\]\.join\("\\n"\)/.exec(s);
+            if (!m) { console.error("CONFIRM_JXA not found in the bundle"); process.exit(1); }
+            require("fs").writeFileSync(process.argv[2], Function("return [" + m[1] + "]")().join("\n"));
+          ' "$INSTALL/app/connector.mjs" "$RUNNER_TEMP/confirm.js"
+          osacompile -l JavaScript -o "$RUNNER_TEMP/confirm.scpt" "$RUNNER_TEMP/confirm.js"
+
+      - name: A dedicated unlocked keychain for the e2e key store
+        run: |
+          set -euo pipefail
+          security create-keychain -p ci-e2e e2e.keychain
+          security set-keychain-settings e2e.keychain
+          security unlock-keychain -p ci-e2e e2e.keychain
+          security list-keychains -d user -s e2e.keychain $(security list-keychains -d user | xargs)
+          security default-keychain -d user -s e2e.keychain
+
+      - name: End to end on a synthetic encrypted WeChat 4.x account
+        run: '"$RUNNER_TEMP/venv/bin/python" wechat-connector/scripts/mac-e2e.py --install-dir "$INSTALL" --work "$RUNNER_TEMP/e2e"'
+
+      - name: Uninstall (with --purge)
+        run: |
+          set -euo pipefail
+          sh "$INSTALL/uninstall.sh" --purge
+          [ ! -e "$INSTALL" ]
+          [ ! -e "$HOME/Library/LaunchAgents/com.entropyark.fleet-wechat-connector.plist" ]
+          ! security find-generic-password -s FleetWeChatConnector.wechat4-keys >/dev/null 2>&1
+          ! curl -s -m 3 http://127.0.0.1:7430/v1/health
+
+      - name: Service log (always)
+        if: always()
+        run: tail -n 80 "$HOME/Library/Application Support/FleetWeChatConnector/logs/service.log" 2>/dev/null || true
