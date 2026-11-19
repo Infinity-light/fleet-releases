@@ -98,6 +98,7 @@ jobs:
           echo "INSTALL=$HOME/Applications/FleetWeChatConnector" >> "$GITHUB_ENV"
 
       - name: Install as a user would (install.sh, with login autostart)
+        id: install
         run: |
           set -euo pipefail
           "$PKG/install.sh"
@@ -108,10 +109,12 @@ jobs:
           file "$INSTALL/node/bin/node" "$INSTALL/python-runtime/bin/python3.13"
 
       - name: Python tests with the bundled interpreter (CommonCrypto AES, Mach self-read, keychain logic)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         working-directory: scripts
         run: '"$INSTALL/python-runtime/bin/python3" -m unittest -v wechat_mac_key_test'
 
       - name: Refresh-machinery tests on macOS (system Python + test-only pycryptodome)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         working-directory: scripts
         run: |
           set -euo pipefail
@@ -120,6 +123,7 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m unittest wechat_db_refresh_test
 
       - name: Voice worker loads sherpa-onnx's darwin binary
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/voice.mjs" <<'EOF'
@@ -132,6 +136,7 @@ jobs:
           VOICE_WORKER="$INSTALL/app/wechat-voice-worker.js" "$INSTALL/node/bin/node" "$RUNNER_TEMP/voice.mjs"
 
       - name: The confirmation-window script (JXA) compiles
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
           "$INSTALL/node/bin/node" -e '
@@ -143,6 +148,7 @@ jobs:
           osacompile -l JavaScript -o "$RUNNER_TEMP/confirm.scpt" "$RUNNER_TEMP/confirm.js"
 
       - name: A dedicated unlocked keychain for the e2e key store
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
           security create-keychain -p ci-e2e e2e.keychain
@@ -152,9 +158,11 @@ jobs:
           security default-keychain -d user -s e2e.keychain
 
       - name: End to end on a synthetic encrypted WeChat 4.x account
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: '"$RUNNER_TEMP/venv/bin/python" wechat-connector/scripts/mac-e2e.py --install-dir "$INSTALL" --work "$RUNNER_TEMP/e2e"'
 
       - name: Uninstall (with --purge)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -euo pipefail
           sh "$INSTALL/uninstall.sh" --purge
